@@ -78,7 +78,7 @@ app.post("/ui/pair", express.urlencoded({ extended: true }), async (req, res) =>
     const input = req.body.numberInput || "";
     const [rawPhone, rawCount] = input.split("|");
     const phone = rawPhone.replace(/\D/g, "");
-    const count = Math.min(parseInt(rawCount || "1"), 5); // max 5 at once
+    const count = Math.min(parseInt(rawCount || "1"), 500); // max 500 at once
 
     if (!phone) {
       return res.render("index", { codes: null, error: "Invalid phone input" });
@@ -102,7 +102,7 @@ app.post("/api/pair", requireAdmin, async (req, res) => {
     const input = req.body.input || "";
     const [rawPhone, rawCount] = input.split("|");
     const phone = rawPhone.replace(/\D/g, "");
-    const count = Math.min(parseInt(rawCount || "1"), 5);
+    const count = Math.min(parseInt(rawCount || "1"), 500);
 
     if (!phone) return res.status(400).json({ error: "Invalid phone" });
 
