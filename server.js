@@ -1,35 +1,36 @@
 // server.js
 const express = require("express");
-const bodyParser = require("body-parser");
+const fs = require("fs");
+const chalk = require("chalk");
 const { Boom } = require("@hapi/boom");
 const {
-  makeWASocket,
+  default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
 } = require("@whiskeysockets/baileys");
-const chalk = require("chalk");
-const fs = require("fs");
-require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const ADMIN_KEY = process.env.ADMIN_KEY || "changeme";
-const PAIR_DELAY = parseInt(process.env.PAIR_DELAY || "1000", 10); // ms
-const SESSION_DIR = "./baileys_auth";
+const SESSION_DIR = "./sessions";
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.set("view engine", "ejs");
+app.use(express.json());
 
-let sock;
+let sock; // keep global
 
+// Delay helper
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+/**
+ * Start Baileys socket
+ */
 async function startSock() {
+  console.log(chalk.yellow("🚀 Starting WhatsApp socket..."));
+
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
   sock = makeWASocket({
     auth: state,
-    printQRInTerminal: false,
-    browser: ["PairingServer", "Render", "1.0"],
+    printQRInTerminal: true, // just in case
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -38,49 +39,38 @@ async function startSock() {
     const { connection, lastDisconnect } = update;
 
     if (connection === "open") {
-      console.log(chalk.green.bold("[SOCK] Connected ✅ Ready for pairing codes"));
+      console.log(chalk.green("[SOCK] ✅ Connected and ready"));
     } else if (connection === "close") {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      console.log(chalk.red(`[SOCK] Disconnected ❌ Reason: ${reason}`));
+      console.log(chalk.red(`[SOCK] ❌ Disconnected. Reason: ${reason}`));
 
       switch (reason) {
         case DisconnectReason.badSession:
-          console.error("Bad session. Clearing session and restarting...");
-          fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-          return startSock();
+          console.log("Bad session. Clearing and restarting...");
+          clearSessionAndRestart();
+          break;
         case DisconnectReason.connectionClosed:
         case DisconnectReason.connectionLost:
         case DisconnectReason.timedOut:
         case DisconnectReason.restartRequired:
           console.log("Reconnecting...");
-          return startSock();
+          startSock();
+          break;
         case DisconnectReason.loggedOut:
-          console.error("Logged out. Clearing session and waiting restart...");
-          fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-          process.exit(0);
+          console.log("Logged out. Clearing and restarting...");
+          clearSessionAndRestart();
+          break;
         default:
-          console.log("Unknown disconnect reason, retrying...");
-          return startSock();
+          console.log("Unknown disconnect. Restarting...");
+          startSock();
       }
     }
   });
 }
 
-startSock();
-
-// --- Helpers ---
-function requireAdmin(req, res, next) {
-  const key = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
-  if (key !== ADMIN_KEY) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
-  next();
-}
-
-function formatCode(code) {
-  return code?.match(/.{1,4}/g)?.join("-") || code;
-}
-
+/**
+ * Clear session and restart socket
+ */
 function clearSessionAndRestart() {
   try {
     if (fs.existsSync(SESSION_DIR)) {
@@ -90,80 +80,51 @@ function clearSessionAndRestart() {
   } catch (err) {
     console.error("Error clearing session:", err);
   }
-  console.log(chalk.yellow("🔄 Restarting process..."));
-  process.exit(0);
+  console.log(chalk.yellow("🔄 Restarting socket..."));
+  startSock();
 }
 
-// --- UI Routes ---
+/**
+ * API: /spam
+ * Example body: { "number": "233xxxxxxxxx", "count": 2 }
+ */
+app.post("/spam", async (req, res) => {
+  const { number, count } = req.body;
+
+  if (!number || !count) {
+    return res.status(400).json({ error: "Missing number or count" });
+  }
+
+  if (!sock) {
+    return res.status(500).json({ error: "Socket not initialized yet" });
+  }
+
+  console.log(chalk.blue(`📡 Spam request: ${number} | Count: ${count}`));
+
+  try {
+    for (let i = 0; i < count; i++) {
+      const code = await sock.requestPairingCode(number);
+      console.log(chalk.green(`✅ Pairing Code [${i + 1}/${count}]: ${code}`));
+      await sleep(1000); // 1 second delay
+    }
+
+    // after spam, reset session
+    console.log(chalk.yellow("⚡ Spam finished. Restarting session..."));
+    clearSessionAndRestart();
+
+    return res.json({ success: true, message: `Requested ${count} codes.` });
+  } catch (err) {
+    console.error("❌ Error during spam:", err);
+    clearSessionAndRestart();
+    return res.status(500).json({ error: "Failed during spam, restarting..." });
+  }
+});
+
 app.get("/", (req, res) => {
-  res.render("index", { codes: null, error: null });
+  res.send("✅ WhatsApp Pairing Code Spammer running on Render.");
 });
 
-app.post("/ui/pair", async (req, res) => {
-  try {
-    const input = req.body.numberInput || "";
-    const [rawPhone, rawCount] = input.split("|");
-    const phone = rawPhone.replace(/\D/g, "");
-    const count = Math.min(parseInt(rawCount || "1", 10), 500);
-
-    if (!phone) return res.render("index", { codes: null, error: "Invalid phone input" });
-
-    console.log(chalk.blue(`[REQ][UI] Phone: ${phone}, Count: ${count}`));
-    const codes = [];
-
-    for (let i = 0; i < count; i++) {
-      let code = await sock.requestPairingCode(phone);
-      code = formatCode(code);
-      console.log(chalk.yellow(`[CODE][UI] ${phone} -> ${code}`));
-      codes.push(code);
-      if (i < count - 1) await new Promise((r) => setTimeout(r, PAIR_DELAY));
-    }
-
-    res.render("index", { codes, error: null });
-    clearSessionAndRestart(); // restart after successful spam
-  } catch (err) {
-    console.error("[ERR][UI]", err);
-    res.render("index", { codes: null, error: "Failed to get codes" });
-    clearSessionAndRestart(); // restart after error
-  }
-});
-
-// --- API Route ---
-app.post("/api/pair", requireAdmin, async (req, res) => {
-  try {
-    const input = req.body.input || "";
-    const [rawPhone, rawCount] = input.split("|");
-    const phone = rawPhone.replace(/\D/g, "");
-    const count = Math.min(parseInt(rawCount || "1", 10), 500);
-
-    if (!phone) return res.status(400).json({ error: "Invalid phone" });
-
-    console.log(chalk.blue(`[REQ][API] Phone: ${phone}, Count: ${count}`));
-    const codes = [];
-
-    for (let i = 0; i < count; i++) {
-      let code = await sock.requestPairingCode(phone);
-      code = formatCode(code);
-      console.log(chalk.magenta(`[CODE][API] ${phone} -> ${code}`));
-      codes.push(code);
-      if (i < count - 1) await new Promise((r) => setTimeout(r, PAIR_DELAY));
-    }
-
-    res.json({ phone, codes });
-    clearSessionAndRestart(); // restart after successful spam
-  } catch (err) {
-    console.error("[ERR][API]", err);
-    res.status(500).json({ error: "Failed to get codes" });
-    clearSessionAndRestart(); // restart after error
-  }
-});
-
-// --- Healthcheck Route ---
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", connected: !!sock?.user });
-});
-
-// --- Start server ---
 app.listen(PORT, () => {
-  console.log(chalk.green(`[BOOT] Server running on http://localhost:${PORT}`));
+  console.log(chalk.cyan(`🌍 Server running at http://localhost:${PORT}`));
+  startSock(); // start Baileys when server boots
 });
