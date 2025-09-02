@@ -2,7 +2,12 @@
 const express = require("express");
 const bodyParser = require("body-parser");
 const { Boom } = require("@hapi/boom");
-const { makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+} = require("@whiskeysockets/baileys");
+const chalk = require("chalk");
 require("dotenv").config();
 
 const app = express();
@@ -14,14 +19,51 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.set("view engine", "ejs");
 
-// --- Setup Baileys socket ---
 let sock;
-(async () => {
+
+async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState("baileys_auth");
-  sock = makeWASocket({ auth: state });
+
+  sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: false,
+    browser: ["PairingServer", "Render", "1.0"],
+  });
+
   sock.ev.on("creds.update", saveCreds);
-  console.log("[INIT] Socket ready for pairing code requests.");
-})();
+
+  sock.ev.on("connection.update", async (update) => {
+    const { connection, lastDisconnect } = update;
+
+    if (connection === "open") {
+      console.log(chalk.green.bold("[SOCK] Connected ✅ Ready for pairing codes"));
+    } else if (connection === "close") {
+      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
+      console.log(chalk.red(`[SOCK] Disconnected ❌ Reason: ${reason}`));
+
+      switch (reason) {
+        case DisconnectReason.badSession:
+          console.error("Bad session. Clearing session and restarting...");
+          fs.rmSync("./baileys_auth", { recursive: true, force: true });
+          return startSock();
+        case DisconnectReason.connectionClosed:
+        case DisconnectReason.connectionLost:
+        case DisconnectReason.timedOut:
+        case DisconnectReason.restartRequired:
+          console.log("Reconnecting...");
+          return startSock();
+        case DisconnectReason.loggedOut:
+          console.error("Logged out. Delete auth folder and restart manually.");
+          return;
+        default:
+          console.log("Unknown disconnect reason, retrying...");
+          return startSock();
+      }
+    }
+  });
+}
+
+startSock();
 
 // --- Middleware: API key check ---
 function requireAdmin(req, res, next) {
@@ -30,6 +72,11 @@ function requireAdmin(req, res, next) {
     return res.status(403).json({ error: "Forbidden" });
   }
   next();
+}
+
+// Format code into XXXX-XXXX style
+function formatCode(code) {
+  return code?.match(/.{1,4}/g)?.join("-") || code;
 }
 
 // --- UI Routes ---
@@ -46,14 +93,15 @@ app.post("/ui/pair", async (req, res) => {
 
     if (!phone) return res.render("index", { codes: null, error: "Invalid phone input" });
 
-    console.log(`[REQ][UI] Phone: ${phone}, Count: ${count}`);
+    console.log(chalk.blue(`[REQ][UI] Phone: ${phone}, Count: ${count}`));
     const codes = [];
 
     for (let i = 0; i < count; i++) {
-      const code = await sock.requestPairingCode(phone);
-      console.log(`[CODE][UI] ${phone} -> ${code}`);
+      let code = await sock.requestPairingCode(phone);
+      code = formatCode(code);
+      console.log(chalk.yellow(`[CODE][UI] ${phone} -> ${code}`));
       codes.push(code);
-      if (i < count - 1) await new Promise(r => setTimeout(r, PAIR_DELAY));
+      if (i < count - 1) await new Promise((r) => setTimeout(r, PAIR_DELAY));
     }
 
     res.render("index", { codes, error: null });
@@ -73,14 +121,15 @@ app.post("/api/pair", requireAdmin, async (req, res) => {
 
     if (!phone) return res.status(400).json({ error: "Invalid phone" });
 
-    console.log(`[REQ][API] Phone: ${phone}, Count: ${count}`);
+    console.log(chalk.blue(`[REQ][API] Phone: ${phone}, Count: ${count}`));
     const codes = [];
 
     for (let i = 0; i < count; i++) {
-      const code = await sock.requestPairingCode(phone);
-      console.log(`[CODE][API] ${phone} -> ${code}`);
+      let code = await sock.requestPairingCode(phone);
+      code = formatCode(code);
+      console.log(chalk.magenta(`[CODE][API] ${phone} -> ${code}`));
       codes.push(code);
-      if (i < count - 1) await new Promise(r => setTimeout(r, PAIR_DELAY));
+      if (i < count - 1) await new Promise((r) => setTimeout(r, PAIR_DELAY));
     }
 
     res.json({ phone, codes });
@@ -90,7 +139,12 @@ app.post("/api/pair", requireAdmin, async (req, res) => {
   }
 });
 
+// --- Healthcheck Route ---
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", connected: !!sock?.user });
+});
+
 // --- Start server ---
 app.listen(PORT, () => {
-  console.log(`[BOOT] Server running on http://localhost:${PORT}`);
+  console.log(chalk.green(`[BOOT] Server running on http://localhost:${PORT}`));
 });
