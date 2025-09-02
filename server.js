@@ -8,12 +8,14 @@ const {
   DisconnectReason,
 } = require("@whiskeysockets/baileys");
 const chalk = require("chalk");
+const fs = require("fs");
 require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || "changeme";
 const PAIR_DELAY = parseInt(process.env.PAIR_DELAY || "1000", 10); // ms
+const SESSION_DIR = "./baileys_auth";
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -22,7 +24,7 @@ app.set("view engine", "ejs");
 let sock;
 
 async function startSock() {
-  const { state, saveCreds } = await useMultiFileAuthState("baileys_auth");
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
   sock = makeWASocket({
     auth: state,
@@ -44,7 +46,7 @@ async function startSock() {
       switch (reason) {
         case DisconnectReason.badSession:
           console.error("Bad session. Clearing session and restarting...");
-          fs.rmSync("./baileys_auth", { recursive: true, force: true });
+          fs.rmSync(SESSION_DIR, { recursive: true, force: true });
           return startSock();
         case DisconnectReason.connectionClosed:
         case DisconnectReason.connectionLost:
@@ -53,8 +55,9 @@ async function startSock() {
           console.log("Reconnecting...");
           return startSock();
         case DisconnectReason.loggedOut:
-          console.error("Logged out. Delete auth folder and restart manually.");
-          return;
+          console.error("Logged out. Clearing session and waiting restart...");
+          fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+          process.exit(0);
         default:
           console.log("Unknown disconnect reason, retrying...");
           return startSock();
@@ -65,7 +68,7 @@ async function startSock() {
 
 startSock();
 
-// --- Middleware: API key check ---
+// --- Helpers ---
 function requireAdmin(req, res, next) {
   const key = req.headers["x-admin-key"] || req.body.adminKey || req.query.adminKey;
   if (key !== ADMIN_KEY) {
@@ -74,9 +77,21 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// Format code into XXXX-XXXX style
 function formatCode(code) {
   return code?.match(/.{1,4}/g)?.join("-") || code;
+}
+
+function clearSessionAndRestart() {
+  try {
+    if (fs.existsSync(SESSION_DIR)) {
+      fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+      console.log(chalk.red("🗑️ Session cleared."));
+    }
+  } catch (err) {
+    console.error("Error clearing session:", err);
+  }
+  console.log(chalk.yellow("🔄 Restarting process..."));
+  process.exit(0);
 }
 
 // --- UI Routes ---
@@ -105,9 +120,11 @@ app.post("/ui/pair", async (req, res) => {
     }
 
     res.render("index", { codes, error: null });
+    clearSessionAndRestart(); // restart after successful spam
   } catch (err) {
     console.error("[ERR][UI]", err);
     res.render("index", { codes: null, error: "Failed to get codes" });
+    clearSessionAndRestart(); // restart after error
   }
 });
 
@@ -133,9 +150,11 @@ app.post("/api/pair", requireAdmin, async (req, res) => {
     }
 
     res.json({ phone, codes });
+    clearSessionAndRestart(); // restart after successful spam
   } catch (err) {
     console.error("[ERR][API]", err);
     res.status(500).json({ error: "Failed to get codes" });
+    clearSessionAndRestart(); // restart after error
   }
 });
 
