@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WhatsApp Pairing Codes</title>
+  <style>
+    body { font-family: sans-serif; padding: 2rem; }
+    input { padding: 0.5rem; width: 250px; }
+    button { padding: 0.5rem 1rem; margin-left: 0.5rem; }
+    .codes { margin-top: 1rem; font-size: 1.2rem; }
+    .error { color: red; }
+  </style>
+</head>
+<body>
+  <h1>Get Pairing Codes</h1>
+  <form method="POST" action="/ui/pair">
+    <input name="numberInput" placeholder="233xxxxxxx|2" />
+    <button type="submit">Generate</button>
+  </form>
+
+  <% if (error) { %>
+    <div class="error"><%= error %></div>
+  <% } %>
+
+  <% if (codes) { %>
+    <div class="codes">
+      <h2>Codes:</h2>
+      <ul>
+        <% codes.forEach(c => { %>
+          <li><code><%= c %></code></li>
+        <% }) %>
+      </ul>
+    </div>
+  <% } %>
+</body>
+  </html>
