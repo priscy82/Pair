@@ -1,27 +1,49 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>WhatsApp Pairing Code Generator</title>
+  <meta charset="utf-8" />
+  <title>WhatsApp Pairing Codes</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; max-width:800px; margin:2rem auto; padding:1rem; }
+    input, button { padding:0.6rem; font-size:1rem; }
+    .codes { margin-top:1rem; background:#f6f8fa; padding:1rem; border-radius:6px; }
+    .error { color: #b00020; margin-top:1rem; }
+    label { display:block; margin-bottom:0.5rem; }
+  </style>
 </head>
 <body>
-  <h2>Pairing Code Generator</h2>
-  <form action="/ui/pair" method="POST">
-    <label>Number|Count:</label>
-    <input type="text" name="numberInput" placeholder="233xxxxxxx|2" required>
-    <button type="submit">Get Codes</button>
+  <h1>WhatsApp Pairing Code Generator</h1>
+  <form method="POST" action="/ui/pair">
+    <label>Enter number and optional count (format: 233XXXXXXXXX|2) or use fields below:</label>
+    <input type="text" name="numberInput" placeholder="233xxxxxxxxx|2" style="width: 100%; margin-bottom:0.5rem;" />
+    <div style="display:flex; gap:8px; margin-bottom: 0.5rem;">
+      <input type="text" name="number" placeholder="Or number only e.g. 233xxxxxxxxx" style="flex:1" />
+      <input type="number" name="count" min="1" placeholder="Count" style="width:120px" />
+    </div>
+    <button type="submit">Generate Codes</button>
   </form>
 
   <% if (error) { %>
-    <p style="color:red;"><%= error %></p>
+    <div class="error"><%= error %></div>
   <% } %>
 
-  <% if (codes) { %>
-    <h3>Codes:</h3>
-    <ul>
-      <% codes.forEach(c => { %>
-        <li><code><%= c %></code></li>
-      <% }) %>
-    </ul>
+  <% if (codes && codes.length) { %>
+    <div class="codes">
+      <h3>Codes</h3>
+      <ul>
+        <% codes.forEach((c, idx) => { %>
+          <li><strong><%= idx + 1 %></strong>: <code><%= c %></code></li>
+        <% }) %>
+      </ul>
+    </div>
   <% } %>
+
+  <hr style="margin-top:2rem" />
+  <div>
+    <strong>API</strong>
+    <pre>POST /spam  { "number": "233xxx", "count": 2 }</pre>
+    <strong>Status</strong>
+    <pre>/status</pre>
+  </div>
 </body>
 </html>
