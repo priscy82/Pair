@@ -1,49 +1,496 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>WhatsApp Pairing Codes</title>
-  <style>
-    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; max-width:800px; margin:2rem auto; padding:1rem; }
-    input, button { padding:0.6rem; font-size:1rem; }
-    .codes { margin-top:1rem; background:#f6f8fa; padding:1rem; border-radius:6px; }
-    .error { color: #b00020; margin-top:1rem; }
-    label { display:block; margin-bottom:0.5rem; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Pairing Code Generator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 40px;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 300;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .status-bar {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-weight: 500;
+        }
+
+        .status-connected {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status-connecting {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .status-disconnected {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        .user-info {
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        @media (max-width: 768px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .header h1 {
+                font-size: 2rem;
+            }
+            
+            .status-bar {
+                flex-direction: column;
+                align-items: stretch;
+            }
+        }
+
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        }
+
+        .card h2 {
+            font-size: 1.5rem;
+            color: #333;
+            margin-bottom: 25px;
+            font-weight: 600;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #555;
+            font-weight: 500;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e1e5e9;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s ease;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .form-divider {
+            text-align: center;
+            margin: 25px 0;
+            color: #999;
+            font-weight: 500;
+        }
+
+        .submit-btn {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+        }
+
+        .submit-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+        }
+
+        .submit-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .alert {
+            padding: 15px 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .codes-container {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .code-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 15px;
+            border: 1px solid #e1e5e9;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            background: #f8f9fa;
+        }
+
+        .code-value {
+            font-family: 'Courier New', monospace;
+            font-size: 1.1rem;
+            font-weight: bold;
+            color: #333;
+        }
+
+        .copy-btn {
+            padding: 6px 12px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: background 0.2s ease;
+        }
+
+        .copy-btn:hover {
+            background: #5a6fd8;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: #666;
+        }
+
+        .empty-state h3 {
+            font-size: 1.2rem;
+            margin-bottom: 10px;
+            color: #333;
+        }
+
+        .api-docs {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        }
+
+        .api-docs h3 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.3rem;
+        }
+
+        .endpoint {
+            background: #f8f9fa;
+            border: 1px solid #e1e5e9;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+
+        .endpoint-method {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+
+        .method-post {
+            background: #28a745;
+            color: white;
+        }
+
+        .method-get {
+            background: #007bff;
+            color: white;
+        }
+
+        .endpoint-path {
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+        }
+
+        .endpoint-desc {
+            margin-top: 8px;
+            color: #666;
+            font-size: 0.9rem;
+        }
+    </style>
 </head>
 <body>
-  <h1>WhatsApp Pairing Code Generator</h1>
-  <form method="POST" action="/ui/pair">
-    <label>Enter number and optional count (format: 233XXXXXXXXX|2) or use fields below:</label>
-    <input type="text" name="numberInput" placeholder="233xxxxxxxxx|2" style="width: 100%; margin-bottom:0.5rem;" />
-    <div style="display:flex; gap:8px; margin-bottom: 0.5rem;">
-      <input type="text" name="number" placeholder="Or number only e.g. 233xxxxxxxxx" style="flex:1" />
-      <input type="number" name="count" min="1" placeholder="Count" style="width:120px" />
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>WhatsApp Pairing Code Generator</h1>
+            <p>Professional testing tool for bug bounty workflows</p>
+        </div>
+
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-indicator <%= connected ? 'status-connected' : (status === 'connecting' ? 'status-connecting' : 'status-disconnected') %>">
+                <div class="status-dot"></div>
+                <span>
+                    <% if (connected) { %>
+                        Connected
+                    <% } else if (status === 'connecting') { %>
+                        Connecting...
+                    <% } else { %>
+                        Disconnected
+                    <% } %>
+                </span>
+            </div>
+            <% if (user) { %>
+                <div class="user-info">
+                    User: <%= user.name || user.verifiedName || 'Unknown' %>
+                    <% if (user.id) { %>
+                        (<%= user.id.split('@')[0] %>)
+                    <% } %>
+                </div>
+            <% } %>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-grid">
+            <!-- Input Form -->
+            <div class="card">
+                <h2>Generate Pairing Codes</h2>
+
+                <!-- Alerts -->
+                <% if (error) { %>
+                    <div class="alert alert-error">
+                        <%= error %>
+                    </div>
+                <% } %>
+
+                <% if (success) { %>
+                    <div class="alert alert-success">
+                        <%= success %>
+                    </div>
+                <% } %>
+
+                <form action="/ui/generate" method="POST">
+                    <!-- Combined Input -->
+                    <div class="form-group">
+                        <label for="combined">Combined Input (number|count)</label>
+                        <input 
+                            type="text" 
+                            id="combined" 
+                            name="combined" 
+                            class="form-input"
+                            placeholder="e.g., 233201234567|3"
+                        >
+                    </div>
+
+                    <div class="form-divider">OR</div>
+
+                    <!-- Separate Fields -->
+                    <div class="form-group">
+                        <label for="number">Phone Number</label>
+                        <input 
+                            type="text" 
+                            id="number" 
+                            name="number" 
+                            class="form-input"
+                            placeholder="e.g., 233201234567"
+                        >
+                    </div>
+
+                    <div class="form-group">
+                        <label for="count">Count (1-500)</label>
+                        <input 
+                            type="number" 
+                            id="count" 
+                            name="count" 
+                            class="form-input"
+                            min="1" 
+                            max="500"
+                            placeholder="e.g., 3"
+                        >
+                    </div>
+
+                    <button 
+                        type="submit" 
+                        class="submit-btn"
+                        <%= !connected ? 'disabled' : '' %>
+                    >
+                        <% if (!connected) { %>
+                            WhatsApp Not Connected
+                        <% } else { %>
+                            Generate Codes
+                        <% } %>
+                    </button>
+                </form>
+            </div>
+
+            <!-- Results -->
+            <div class="card">
+                <h2>Generated Codes</h2>
+
+                <% if (codes && codes.length > 0) { %>
+                    <div class="codes-container">
+                        <% codes.forEach((code, index) => { %>
+                            <div class="code-item">
+                                <span class="code-value"><%= code %></span>
+                                <button class="copy-btn" onclick="copyCode('<%= code %>')">
+                                    Copy
+                                </button>
+                            </div>
+                        <% }); %>
+                    </div>
+                <% } else { %>
+                    <div class="empty-state">
+                        <h3>No codes generated yet</h3>
+                        <p>Use the form to generate WhatsApp pairing codes</p>
+                    </div>
+                <% } %>
+            </div>
+        </div>
+
+        <!-- API Documentation -->
+        <div class="api-docs">
+            <h3>API Endpoints</h3>
+            
+            <div class="endpoint">
+                <div>
+                    <span class="endpoint-method method-post">POST</span>
+                    <span class="endpoint-path">/api/generate</span>
+                </div>
+                <div class="endpoint-desc">
+                    Generate pairing codes. Body: <code>{"number": "233201234567", "count": 3}</code>
+                </div>
+            </div>
+
+            <div class="endpoint">
+                <div>
+                    <span class="endpoint-method method-get">GET</span>
+                    <span class="endpoint-path">/api/status</span>
+                </div>
+                <div class="endpoint-desc">
+                    Get connection status and user information
+                </div>
+            </div>
+        </div>
     </div>
-    <button type="submit">Generate Codes</button>
-  </form>
 
-  <% if (error) { %>
-    <div class="error"><%= error %></div>
-  <% } %>
+    <script>
+        function copyCode(code) {
+            navigator.clipboard.writeText(code).then(() => {
+                // Show temporary feedback
+                const event = new CustomEvent('show-toast', {
+                    detail: { message: `Code ${code} copied!`, type: 'success' }
+                });
+                window.dispatchEvent(event);
+            }).catch(err => {
+                console.error('Failed to copy:', err);
+            });
+        }
 
-  <% if (codes && codes.length) { %>
-    <div class="codes">
-      <h3>Codes</h3>
-      <ul>
-        <% codes.forEach((c, idx) => { %>
-          <li><strong><%= idx + 1 %></strong>: <code><%= c %></code></li>
-        <% }) %>
-      </ul>
-    </div>
-  <% } %>
-
-  <hr style="margin-top:2rem" />
-  <div>
-    <strong>API</strong>
-    <pre>POST /spam  { "number": "233xxx", "count": 2 }</pre>
-    <strong>Status</strong>
-    <pre>/status</pre>
-  </div>
+        // Simple toast notification
+        window.addEventListener('show-toast', (e) => {
+            const toast = document.createElement('div');
+            toast.textContent = e.detail.message;
+            toast.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                background: ${e.detail.type === 'success' ? '#28a745' : '#dc3545'};
+                color: white;
+                padding: 12px 20px;
+                border-radius: 8px;
+                font-weight: 500;
+                z-index: 1000;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            `;
+            
+            document.body.appendChild(toast);
+            
+            setTimeout(() => {
+                toast.remove();
+            }, 3000);
+        });
+    </script>
 </body>
 </html>
