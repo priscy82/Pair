@@ -8,7 +8,7 @@
     "dev": "node server.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.5",
+    "@whiskeysockets/baileys": "^6.7.18",
     "@hapi/boom": "^10.0.1",
     "chalk": "~4.1.0",
      "helmet": "^7.1.0",
