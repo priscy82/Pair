@@ -1,406 +1,474 @@
 const express = require('express');
-const path = require('path');
-const fs = require('fs');
-const chalk = require('chalk');
 const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
+const chalk = require('chalk');
+const fs = require('fs');
+const path = require('path');
+const rateLimit = require('express-rate-limit');
+const crypto = require('crypto');
 
-const app = express();
+// Environment variables
 const PORT = process.env.PORT || 3000;
-
-// Middleware
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
+const ADMIN_KEY = process.env.ADMIN_KEY || 'default-admin-key-change-this';
+const MAX_COUNT = parseInt(process.env.MAX_COUNT) || 500;
+const PAIR_DELAY = parseInt(process.env.PAIR_DELAY) || 1000;
+const ALLOWED_PHONES = process.env.ALLOWED_PHONES ? process.env.ALLOWED_PHONES.split(',') : null;
 
 // Global state
 let sock = null;
-let isConnected = false;
-let connectionStatus = 'disconnected';
-let userInfo = null;
+let socketReady = false;
+let saveCreds = null;
+const phoneQueues = new Map();
 
-// Helper function for delays
+// App setup
+const app = express();
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Rate limiting for API
+const apiLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 10, // 10 requests per minute
+  message: { error: 'Too many requests, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Utility functions
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Colored logging system with specific prefixes as requested
 const log = {
-  boot: (msg) => console.log(chalk.cyan('[BOOT]'), msg),
-  sock: (msg, isError = false) => console.log(
-    isError ? chalk.red('[SOCK]') : chalk.green('[SOCK]'), 
-    msg
-  ),
-  req: (msg) => console.log(chalk.blue('[REQ]'), msg),
-  code: (msg) => console.log(chalk.yellow('[CODE]'), msg),
-  err: (msg) => console.log(chalk.red('[ERR]'), msg),
-  reset: (msg) => console.log(chalk.yellow('[RESET]'), msg)
+  boot: (msg) => console.log(chalk.blue(`[BOOT] ${msg}`)),
+  sock: (msg) => console.log(chalk.green(`[SOCK] ${msg}`)),
+  req: (msg) => console.log(chalk.yellow(`[REQ] ${msg}`)),
+  code: (msg) => console.log(chalk.magenta(`[CODE] ${msg}`)),
+  reset: (msg) => console.log(chalk.red(`[RESET] ${msg}`)),
+  err: (msg) => console.log(chalk.red(`[ERR] ${msg}`))
 };
 
-// Session management
-const sessionsDir = path.join(__dirname, 'sessions');
-
-const clearSessionAndRestart = () => {
-  try {
-    // Force delete sessions folder using rmSync as recommended
-    if (fs.existsSync(sessionsDir)) {
-      fs.rmSync(sessionsDir, { recursive: true, force: true });
-      log.reset('🗑️ Session cleared');
+// Ensure directories exist
+const ensureDirectories = () => {
+  const dirs = ['./sessions', './generated_codes', './views'];
+  dirs.forEach(dir => {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
     }
-  } catch (error) {
-    log.err(`Failed to clear session: ${error.message}`);
-  }
-  
-  log.reset('🔄 Restarting socket...');
-  setTimeout(() => startSock(), 2000);
+  });
 };
 
-// WhatsApp socket initialization - renamed from connectToWhatsApp to startSock
+// Clear session and restart
+const clearSessionAndRestart = () => {
+  socketReady = false;
+  if (fs.existsSync('./sessions')) {
+    try {
+      fs.rmSync('./sessions', { recursive: true, force: true });
+      log.reset('Session cleared');
+    } catch (error) {
+      log.err(`Failed to clear session: ${error.message}`);
+    }
+  }
+  setTimeout(() => {
+    startSock();
+  }, 1200);
+};
+
+// Start WhatsApp socket
 const startSock = async () => {
   try {
-    log.sock('Initializing WhatsApp connection...');
+    log.sock('🚀 Starting WhatsApp socket...');
     
-    // Ensure sessions directory exists
-    if (!fs.existsSync(sessionsDir)) {
-      fs.mkdirSync(sessionsDir, { recursive: true });
-    }
+    ensureDirectories();
     
-    const { state, saveCreds } = await useMultiFileAuthState(sessionsDir);
+    const { state, saveCreds: saveCredsFunc } = await useMultiFileAuthState('./sessions');
+    saveCreds = saveCredsFunc;
     
     sock = makeWASocket({
       auth: state,
       printQRInTerminal: true,
-      logger: {
-        level: 'silent',
-        child: () => ({ level: 'silent' })
-      },
-      browser: ['Pairing Code Tool', 'Chrome', '1.0.0']
+      browser: ['WhatsApp Pairing Code Generator', 'Chrome', '1.0.0'],
+      defaultQueryTimeoutMs: 60000,
+      connectTimeoutMs: 60000,
     });
 
-    // Handle connection updates
+    sock.ev.on('creds.update', saveCreds);
+
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
       
       if (qr) {
-        log.sock('QR Code generated - scan with WhatsApp');
+        log.sock('QR Code received - scan with WhatsApp');
+      }
+      
+      if (connection === 'open') {
+        socketReady = true;
+        log.sock('✅ Connected and ready');
       }
       
       if (connection === 'close') {
-        isConnected = false;
-        connectionStatus = 'disconnected';
-        userInfo = null;
+        socketReady = false;
         
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const reason = Object.keys(DisconnectReason).find(
-          key => DisconnectReason[key] === statusCode
-        ) || 'unknown';
-        
-        log.sock(`❌ Connection closed: ${reason} (${statusCode})`, true);
-        
-        // Handle ALL disconnect reasons - NEVER use process.exit()
-        switch (statusCode) {
-          case DisconnectReason.badSession:
-            log.err('❌ Bad session detected - clearing and restarting');
-            clearSessionAndRestart();
-            break;
-            
-          case DisconnectReason.loggedOut:
-            log.err('❌ Logged out - clearing session and restarting');
-            clearSessionAndRestart();
-            break;
-            
-          case DisconnectReason.connectionClosed:
-            log.sock('❌ Connection closed - restarting socket', true);
-            setTimeout(() => startSock(), 3000);
-            break;
-            
-          case DisconnectReason.connectionLost:
-            log.sock('❌ Connection lost - restarting socket', true);
-            setTimeout(() => startSock(), 3000);
-            break;
-            
-          case DisconnectReason.timedOut:
-            log.sock('❌ Connection timed out - restarting socket', true);
-            setTimeout(() => startSock(), 5000);
-            break;
-            
-          case DisconnectReason.restartRequired:
-            log.sock('❌ Restart required - restarting socket', true);
-            setTimeout(() => startSock(), 2000);
-            break;
-            
-          default:
-            log.err(`❌ Unknown disconnect reason: ${reason} - restarting anyway`);
-            setTimeout(() => startSock(), 3000);
-            break;
+        if (lastDisconnect?.error) {
+          const reason = new Boom(lastDisconnect.error)?.output?.statusCode;
+          
+          switch (reason) {
+            case DisconnectReason.badSession:
+              log.reset('badSession — clearing session');
+              clearSessionAndRestart();
+              break;
+            case DisconnectReason.loggedOut:
+              log.reset('loggedOut — clearing session');
+              clearSessionAndRestart();
+              break;
+            case DisconnectReason.connectionClosed:
+            case DisconnectReason.connectionLost:
+            case DisconnectReason.timedOut:
+            case DisconnectReason.restartRequired:
+              log.sock('Reconnecting...');
+              setTimeout(startSock, 2000);
+              break;
+            default:
+              log.err(`Unknown disconnect reason: ${reason}`);
+              setTimeout(startSock, 5000);
+              break;
+          }
+        } else {
+          log.sock('Reconnecting...');
+          setTimeout(startSock, 2000);
         }
-      } else if (connection === 'open') {
-        isConnected = true;
-        connectionStatus = 'connected';
-        userInfo = sock.user;
-        
-        const userName = userInfo?.name || userInfo?.verifiedName || 'Unknown';
-        const userPhone = userInfo?.id?.split('@')[0] || 'Unknown';
-        
-        log.sock(`✅ Connected and ready as ${userName} (${userPhone})`);
-      } else if (connection === 'connecting') {
-        connectionStatus = 'connecting';
-        log.sock('🔄 Connecting to WhatsApp...');
       }
     });
 
-    // Save credentials
-    sock.ev.on('creds.update', saveCreds);
-
   } catch (error) {
-    log.err(`Socket initialization error: ${error.message}`);
-    connectionStatus = 'error';
-    setTimeout(() => startSock(), 10000);
+    log.err(`Failed to start socket: ${error.message}`);
+    setTimeout(startSock, 5000);
   }
 };
 
-// Generate pairing codes with automatic cleanup after EVERY run
-const generatePairingCodes = async (phoneNumber, count) => {
-  if (!sock || !isConnected) {
-    throw new Error('WhatsApp not connected. Please wait for connection.');
+// Save codes to disk
+const saveCodesToDisk = async (phone, count, codes) => {
+  try {
+    ensureDirectories();
+    
+    const timestamp = new Date().toISOString();
+    const dateStr = new Date().toISOString().replace(/[:.]/g, '-').split('T')[0] + '_' + 
+                    new Date().toTimeString().split(' ')[0].replace(/:/g, '');
+    const runId = crypto.randomBytes(8).toString('hex');
+    const filename = `${phone}_${dateStr}_${runId}.json`;
+    const filepath = path.join('./generated_codes', filename);
+    
+    const data = {
+      phone,
+      count,
+      codes,
+      timestamp,
+      runId
+    };
+    
+    // Atomic write
+    const tempFilepath = filepath + '.tmp';
+    fs.writeFileSync(tempFilepath, JSON.stringify(data, null, 2));
+    fs.renameSync(tempFilepath, filepath);
+    
+    // Append to master log
+    const logEntry = `${phone},${timestamp},${count},${filename}\n`;
+    const logPath = path.join('./generated_codes', 'log.csv');
+    
+    if (!fs.existsSync(logPath)) {
+      fs.writeFileSync(logPath, 'phone,timestamp,count,file\n');
+    }
+    fs.appendFileSync(logPath, logEntry);
+    
+    log.reset(`✅ Session saved to ${filepath}`);
+    return filepath;
+    
+  } catch (error) {
+    log.err(`Failed to save codes: ${error.message}`);
+    throw error;
   }
+};
 
-  // Validate phone number
-  const cleanNumber = phoneNumber.replace(/\D/g, '');
-  if (!cleanNumber || cleanNumber.length < 10 || cleanNumber.length > 15) {
-    throw new Error('Invalid phone number. Use format: 233xxxxxxxxx (10-15 digits)');
-  }
-
-  // Validate count
-  const codeCount = parseInt(count);
-  if (codeCount < 1 || codeCount > 500) {
-    throw new Error('Count must be between 1 and 500');
-  }
-
+// Generate pairing codes with real Baileys
+const generatePairingCodes = async (phone, count) => {
   const codes = [];
-  const startTime = Date.now();
   
-  log.req(`🚀 Starting generation of ${codeCount} pairing codes for ${cleanNumber}`);
-
-  try {
-    for (let i = 0; i < codeCount; i++) {
-      // Check connection before each request
-      if (!sock || !isConnected) {
-        throw new Error('Connection lost during code generation');
+  log.req(`/api/generate -> ${phone} (count=${count})`);
+  
+  for (let i = 0; i < count; i++) {
+    try {
+      // REAL BAILEYS IMPLEMENTATION
+      const rawCode = await sock.requestPairingCode(phone);
+      const formattedCode = rawCode.match(/.{1,4}/g)?.join('-') || rawCode;
+      
+      codes.push(formattedCode);
+      log.code(`${i + 1}/${count}: ${formattedCode}`);
+      
+      // Rate limiting - wait between requests
+      if (i < count - 1) {
+        await sleep(PAIR_DELAY);
       }
-
-      try {
-        const code = await sock.requestPairingCode(cleanNumber);
-        codes.push(code);
-        
-        log.code(`📱 [${i + 1}/${codeCount}] Generated: ${code} for ${cleanNumber}`);
-        
-        // Add required 1-second delay between requests (except for last one)
-        if (i < codeCount - 1) {
-          await sleep(1000);
-        }
-      } catch (codeError) {
-        log.err(`Failed to generate code ${i + 1}: ${codeError.message}`);
-        
-        // Handle rate limiting
-        if (codeError.message.includes('rate') || codeError.message.includes('limit')) {
-          log.reset('⏳ Rate limited - waiting 5 seconds...');
-          await sleep(5000);
-          i--; // Retry this iteration
-          continue;
-        }
-        
-        throw new Error(`Code generation failed at ${i + 1}/${codeCount}: ${codeError.message}`);
-      }
+    } catch (error) {
+      log.err(`Failed to generate code ${i + 1}: ${error.message}`);
+      codes.push('failed');
     }
-
-    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-    log.sock(`✅ Generated ${codes.length} codes in ${duration}s`);
-    
-    return codes;
-
-  } finally {
-    // CRITICAL: Always clear session after spam run (success OR error)
-    // This prevents the app from hanging and ensures fresh state
-    log.reset('🧹 Cleaning up after code generation...');
-    setTimeout(() => {
-      clearSessionAndRestart();
-    }, 1000);
   }
+  
+  return codes;
 };
 
-// API Routes
-app.post('/api/generate', async (req, res) => {
-  try {
-    const { number, count } = req.body;
-    
-    log.req(`📥 API request: Generate ${count} codes for ${number}`);
-    
-    if (!number || !count) {
-      return res.status(400).json({
-        success: false,
-        error: 'Missing required fields: number, count'
-      });
-    }
-
-    const codes = await generatePairingCodes(number, count);
-    
-    res.json({
-      success: true,
-      phone: number.replace(/\D/g, ''),
-      codes: codes,
-      count: codes.length,
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    log.err(`API Generate error: ${error.message}`);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
+// Queue system for per-phone processing
+const processPhoneQueue = async (phone) => {
+  if (phoneQueues.get(phone)?.processing) {
+    return;
   }
-});
-
-app.get('/api/status', (req, res) => {
-  log.req('📊 API status check');
   
+  const queue = phoneQueues.get(phone) || { requests: [], processing: false };
+  queue.processing = true;
+  phoneQueues.set(phone, queue);
+  
+  while (queue.requests.length > 0) {
+    const { resolve, reject, count } = queue.requests.shift();
+    
+    try {
+      if (!socketReady || !sock) {
+        throw new Error('Socket not ready');
+      }
+      
+      const codes = await generatePairingCodes(phone, count);
+      const filepath = await saveCodesToDisk(phone, count, codes);
+      
+      resolve({ codes, filepath });
+      
+      // Clear session after successful generation
+      setTimeout(() => {
+        log.reset('⚡ Session cleared — restarting socket...');
+        clearSessionAndRestart();
+      }, 100);
+      
+    } catch (error) {
+      reject(error);
+    }
+    
+    // Small delay between queued requests
+    if (queue.requests.length > 0) {
+      await sleep(2000);
+    }
+  }
+  
+  queue.processing = false;
+};
+
+// Add request to phone queue
+const queuePairingRequest = (phone, count) => {
+  return new Promise((resolve, reject) => {
+    if (!phoneQueues.has(phone)) {
+      phoneQueues.set(phone, { requests: [], processing: false });
+    }
+    
+    const queue = phoneQueues.get(phone);
+    queue.requests.push({ resolve, reject, count });
+    
+    processPhoneQueue(phone);
+  });
+};
+
+// Middleware to check admin key
+const requireAdminKey = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Missing or invalid authorization header' });
+  }
+  
+  const token = authHeader.substring(7);
+  if (token !== ADMIN_KEY) {
+    return res.status(403).json({ error: 'Invalid admin key' });
+  }
+  
+  next();
+};
+
+// Routes
+
+// Status endpoint
+app.get('/api/status', (req, res) => {
   res.json({
     ok: true,
-    connected: isConnected,
-    status: connectionStatus,
-    user: userInfo,
-    timestamp: new Date().toISOString()
+    connected: !!sock?.user,
+    user: sock?.user || null,
+    socketReady,
+    queueSize: Array.from(phoneQueues.values()).reduce((sum, q) => sum + q.requests.length, 0)
   });
 });
 
-// Web UI Routes
+// API Generate endpoint
+app.post('/api/generate', apiLimiter, requireAdminKey, async (req, res) => {
+  try {
+    const { number, count } = req.body;
+    
+    if (!number || !count) {
+      return res.status(400).json({ error: 'Missing number or count' });
+    }
+    
+    if (typeof number !== 'string' || typeof count !== 'number') {
+      return res.status(400).json({ error: 'Invalid number or count type' });
+    }
+    
+    const sanitizedCount = Math.max(1, Math.min(count, MAX_COUNT));
+    
+    if (!socketReady || !sock) {
+      return res.status(503).json({ error: 'Socket not ready' });
+    }
+    
+    if (ALLOWED_PHONES && !ALLOWED_PHONES.includes(number)) {
+      return res.status(403).json({ error: 'Phone number not allowed' });
+    }
+    
+    const { codes, filepath } = await queuePairingRequest(number, sanitizedCount);
+    
+    res.json({
+      success: true,
+      phone: number,
+      codes,
+      file: filepath,
+      generated_at: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    log.err(`API generate error: ${error.message}`);
+    
+    // Still restart on error
+    setTimeout(() => {
+      clearSessionAndRestart();
+    }, 100);
+    
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reset endpoint
+app.post('/api/reset', requireAdminKey, (req, res) => {
+  log.req('/api/reset triggered');
+  clearSessionAndRestart();
+  res.json({ success: true, message: 'Session cleared and socket restarting' });
+});
+
+// Web UI routes
 app.get('/', (req, res) => {
-  log.req('🌐 Web UI accessed');
-  
-  res.render('index', {
-    connected: isConnected,
-    status: connectionStatus,
-    user: userInfo,
-    error: null,
-    success: null,
-    codes: []
+  res.render('index', { 
+    codes: null, 
+    error: null, 
+    connected: socketReady,
+    lastFile: null 
   });
 });
 
 app.post('/ui/generate', async (req, res) => {
-  let { number, count } = req.body;
-  
-  log.req(`📥 UI request: Generate ${count} codes for ${number}`);
-  
   try {
+    let { number, count, combined } = req.body;
+    
+    // Handle combined input (233XXXXXXXXX|N)
+    if (combined && combined.includes('|')) {
+      const parts = combined.split('|');
+      number = parts[0].trim();
+      count = parseInt(parts[1].trim());
+    } else {
+      count = parseInt(count);
+    }
+    
     if (!number || !count) {
-      return res.render('index', {
-        connected: isConnected,
-        status: connectionStatus,
-        user: userInfo,
-        error: 'Please provide both phone number and count',
-        success: null,
-        codes: []
+      return res.render('index', { 
+        codes: null, 
+        error: 'Missing phone number or count',
+        connected: socketReady,
+        lastFile: null 
       });
     }
-
-    const codes = await generatePairingCodes(number, count);
     
-    res.render('index', {
-      connected: isConnected,
-      status: connectionStatus,
-      user: userInfo,
+    const sanitizedCount = Math.max(1, Math.min(count, MAX_COUNT));
+    
+    if (!socketReady || !sock) {
+      return res.render('index', { 
+        codes: null, 
+        error: 'WhatsApp socket not connected - please wait or scan QR code',
+        connected: socketReady,
+        lastFile: null 
+      });
+    }
+    
+    if (ALLOWED_PHONES && !ALLOWED_PHONES.includes(number)) {
+      return res.render('index', { 
+        codes: null, 
+        error: 'Phone number not allowed',
+        connected: socketReady,
+        lastFile: null 
+      });
+    }
+    
+    const { codes, filepath } = await queuePairingRequest(number, sanitizedCount);
+    
+    res.render('index', { 
+      codes, 
       error: null,
-      success: `✅ Generated ${codes.length} pairing codes for ${number.replace(/\D/g, '')}`,
-      codes: codes
+      connected: socketReady,
+      lastFile: filepath
     });
-
+    
   } catch (error) {
-    log.err(`UI Generate error: ${error.message}`);
-    res.render('index', {
-      connected: isConnected,
-      status: connectionStatus,
-      user: userInfo,
-      error: error.message,
-      success: null,
-      codes: []
+    log.err(`UI generate error: ${error.message}`);
+    
+    res.render('index', { 
+      codes: null, 
+      error: `Error: ${error.message}`,
+      connected: socketReady,
+      lastFile: null 
     });
   }
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    whatsapp: {
-      connected: isConnected,
-      status: connectionStatus
-    }
-  });
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  log.err(`Server error: ${err.message}`);
-  res.status(500).json({ 
-    success: false, 
-    error: 'Internal server error' 
-  });
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ 
-    success: false, 
-    error: 'Endpoint not found' 
-  });
-});
-
-// Graceful shutdown handling - REMOVED process.exit()!
-const gracefulShutdown = (signal) => {
-  log.reset(`🛑 Received ${signal} - shutting down gracefully...`);
+// Start server
+const startServer = () => {
+  ensureDirectories();
   
-  if (sock) {
-    try {
-      sock.end();
-      log.sock('WhatsApp connection closed');
-    } catch (error) {
-      log.err(`Error closing WhatsApp connection: ${error.message}`);
+  app.listen(PORT, () => {
+    log.boot(`Server started on port ${PORT}`);
+    log.boot(`Admin key: ${ADMIN_KEY === 'default-admin-key-change-this' ? 'DEFAULT (CHANGE THIS!)' : 'SET'}`);
+    log.boot(`Environment: MAX_COUNT=${MAX_COUNT}, PAIR_DELAY=${PAIR_DELAY}ms`);
+    if (ALLOWED_PHONES) {
+      log.boot(`Allowed phones: ${ALLOWED_PHONES.join(', ')}`);
     }
-  }
-  
-  // CRITICAL FIX: Don't use process.exit() - let process manager handle it
-  log.boot('Shutdown complete - process manager will handle restart');
+    
+    // Start WhatsApp socket
+    startSock();
+  });
 };
 
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  log.boot('Received SIGINT, shutting down gracefully');
+  if (sock) {
+    sock.end();
+  }
+  process.exit(0);
+});
 
-// Global error handlers - REMOVED process.exit()!
+process.on('SIGTERM', () => {
+  log.boot('Received SIGTERM, shutting down gracefully');
+  if (sock) {
+    sock.end();
+  }
+  process.exit(0);
+});
+
+// Prevent unhandled promise rejections from crashing
+process.on('unhandledRejection', (reason, promise) => {
+  log.err(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+});
+
 process.on('uncaughtException', (error) => {
   log.err(`Uncaught Exception: ${error.message}`);
   log.err(error.stack);
-  // CRITICAL FIX: DON'T exit - just log and continue
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  log.err(`Unhandled Rejection at: ${promise}`);
-  log.err(`Reason: ${reason}`);
-  // CRITICAL FIX: DON'T exit - just log and continue
-});
-
-// Start the server
-app.listen(PORT, () => {
-  log.boot(`🚀 WhatsApp Pairing Tool running on port ${PORT}`);
-  log.boot(`📱 Web UI: http://localhost:${PORT}`);
-  log.boot(`🔌 API: http://localhost:${PORT}/api`);
-  log.boot('🎯 Designed for bug bounty pairing code testing');
-  log.boot('');
-  
-  // Initialize WhatsApp connection
-  startSock();
-});
-
-module.exports = app;
+// Start the application
+startServer();
