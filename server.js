@@ -2,7 +2,6 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const chalk = require('chalk');
-const cors = require('cors');
 const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 
@@ -10,63 +9,60 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.set('view engine', 'ejs');
 app.set('views', path.join(__dirname, 'views'));
 
-// Global WhatsApp state
+// Global state
 let sock = null;
 let isConnected = false;
 let connectionStatus = 'disconnected';
 let userInfo = null;
-let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 5;
 
-// Helper functions
+// Helper function for delays
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// Colored logging system with specific prefixes as requested
 const log = {
-  info: (msg) => console.log(chalk.blue('ℹ'), chalk.white(msg)),
-  success: (msg) => console.log(chalk.green('✓'), chalk.white(msg)),
-  warning: (msg) => console.log(chalk.yellow('⚠'), chalk.white(msg)),
-  error: (msg) => console.log(chalk.red('✗'), chalk.white(msg)),
-  debug: (msg) => console.log(chalk.gray('🔍'), chalk.white(msg)),
-  code: (msg) => console.log(chalk.magenta('📱'), chalk.yellow(msg))
+  boot: (msg) => console.log(chalk.cyan('[BOOT]'), msg),
+  sock: (msg, isError = false) => console.log(
+    isError ? chalk.red('[SOCK]') : chalk.green('[SOCK]'), 
+    msg
+  ),
+  req: (msg) => console.log(chalk.blue('[REQ]'), msg),
+  code: (msg) => console.log(chalk.yellow('[CODE]'), msg),
+  err: (msg) => console.log(chalk.red('[ERR]'), msg),
+  reset: (msg) => console.log(chalk.yellow('[RESET]'), msg)
 };
 
 // Session management
 const sessionsDir = path.join(__dirname, 'sessions');
 
-const ensureSessionsDir = () => {
-  if (!fs.existsSync(sessionsDir)) {
-    fs.mkdirSync(sessionsDir, { recursive: true });
-    log.info('Created sessions directory');
-  }
-};
-
-const clearSession = () => {
+const clearSessionAndRestart = () => {
   try {
+    // Force delete sessions folder using rmSync as recommended
     if (fs.existsSync(sessionsDir)) {
-      const files = fs.readdirSync(sessionsDir);
-      files.forEach(file => {
-        const filePath = path.join(sessionsDir, file);
-        fs.unlinkSync(filePath);
-      });
-      log.warning('Session files cleared');
+      fs.rmSync(sessionsDir, { recursive: true, force: true });
+      log.reset('🗑️ Session cleared');
     }
   } catch (error) {
-    log.error(`Failed to clear session: ${error.message}`);
+    log.err(`Failed to clear session: ${error.message}`);
   }
+  
+  log.reset('🔄 Restarting socket...');
+  setTimeout(() => startSock(), 2000);
 };
 
-// WhatsApp connection management
-const connectToWhatsApp = async () => {
+// WhatsApp socket initialization - renamed from connectToWhatsApp to startSock
+const startSock = async () => {
   try {
-    ensureSessionsDir();
+    log.sock('Initializing WhatsApp connection...');
     
-    log.info('Initializing WhatsApp connection...');
+    // Ensure sessions directory exists
+    if (!fs.existsSync(sessionsDir)) {
+      fs.mkdirSync(sessionsDir, { recursive: true });
+    }
     
     const { state, saveCreds } = await useMultiFileAuthState(sessionsDir);
     
@@ -77,15 +73,15 @@ const connectToWhatsApp = async () => {
         level: 'silent',
         child: () => ({ level: 'silent' })
       },
-      browser: ['WhatsApp Pairing Tool', 'Chrome', '1.0.0']
+      browser: ['Pairing Code Tool', 'Chrome', '1.0.0']
     });
 
     // Handle connection updates
-    sock.ev.on('connection.update', async (update) => {
+    sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
       
       if (qr) {
-        log.debug('QR Code generated - scan to connect');
+        log.sock('QR Code generated - scan with WhatsApp');
       }
       
       if (connection === 'close') {
@@ -98,113 +94,146 @@ const connectToWhatsApp = async () => {
           key => DisconnectReason[key] === statusCode
         ) || 'unknown';
         
-        log.warning(`Connection closed: ${reason} (${statusCode})`);
+        log.sock(`❌ Connection closed: ${reason} (${statusCode})`, true);
         
-        // Handle different disconnect reasons
-        if (statusCode === DisconnectReason.badSession || 
-            statusCode === DisconnectReason.loggedOut) {
-          log.warning('Bad session or logged out - clearing session');
-          clearSession();
-          reconnectAttempts = 0;
-          setTimeout(connectToWhatsApp, 3000);
-        } else if (statusCode !== DisconnectReason.loggedOut && 
-                   reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-          reconnectAttempts++;
-          log.info(`Attempting reconnection ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}...`);
-          setTimeout(connectToWhatsApp, 5000 * reconnectAttempts);
-        } else {
-          log.error('Max reconnection attempts reached');
-          connectionStatus = 'failed';
+        // Handle ALL disconnect reasons - NEVER use process.exit()
+        switch (statusCode) {
+          case DisconnectReason.badSession:
+            log.err('❌ Bad session detected - clearing and restarting');
+            clearSessionAndRestart();
+            break;
+            
+          case DisconnectReason.loggedOut:
+            log.err('❌ Logged out - clearing session and restarting');
+            clearSessionAndRestart();
+            break;
+            
+          case DisconnectReason.connectionClosed:
+            log.sock('❌ Connection closed - restarting socket', true);
+            setTimeout(() => startSock(), 3000);
+            break;
+            
+          case DisconnectReason.connectionLost:
+            log.sock('❌ Connection lost - restarting socket', true);
+            setTimeout(() => startSock(), 3000);
+            break;
+            
+          case DisconnectReason.timedOut:
+            log.sock('❌ Connection timed out - restarting socket', true);
+            setTimeout(() => startSock(), 5000);
+            break;
+            
+          case DisconnectReason.restartRequired:
+            log.sock('❌ Restart required - restarting socket', true);
+            setTimeout(() => startSock(), 2000);
+            break;
+            
+          default:
+            log.err(`❌ Unknown disconnect reason: ${reason} - restarting anyway`);
+            setTimeout(() => startSock(), 3000);
+            break;
         }
       } else if (connection === 'open') {
         isConnected = true;
         connectionStatus = 'connected';
         userInfo = sock.user;
-        reconnectAttempts = 0;
         
         const userName = userInfo?.name || userInfo?.verifiedName || 'Unknown';
         const userPhone = userInfo?.id?.split('@')[0] || 'Unknown';
         
-        log.success(`Connected to WhatsApp as ${userName} (${userPhone})`);
+        log.sock(`✅ Connected and ready as ${userName} (${userPhone})`);
       } else if (connection === 'connecting') {
         connectionStatus = 'connecting';
-        log.info('Connecting to WhatsApp...');
+        log.sock('🔄 Connecting to WhatsApp...');
       }
     });
 
-    // Save credentials when updated
+    // Save credentials
     sock.ev.on('creds.update', saveCreds);
 
   } catch (error) {
-    log.error(`Connection error: ${error.message}`);
+    log.err(`Socket initialization error: ${error.message}`);
     connectionStatus = 'error';
-    
-    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-      reconnectAttempts++;
-      setTimeout(connectToWhatsApp, 10000);
-    }
+    setTimeout(() => startSock(), 10000);
   }
 };
 
-// Pairing code generation
+// Generate pairing codes with automatic cleanup after EVERY run
 const generatePairingCodes = async (phoneNumber, count) => {
   if (!sock || !isConnected) {
-    throw new Error('WhatsApp not connected. Please wait for connection or scan QR code.');
+    throw new Error('WhatsApp not connected. Please wait for connection.');
   }
 
-  if (!phoneNumber || !phoneNumber.match(/^\d{10,15}$/)) {
+  // Validate phone number
+  const cleanNumber = phoneNumber.replace(/\D/g, '');
+  if (!cleanNumber || cleanNumber.length < 10 || cleanNumber.length > 15) {
     throw new Error('Invalid phone number. Use format: 233xxxxxxxxx (10-15 digits)');
   }
 
-  if (count < 1 || count > 500) {
+  // Validate count
+  const codeCount = parseInt(count);
+  if (codeCount < 1 || codeCount > 500) {
     throw new Error('Count must be between 1 and 500');
   }
 
   const codes = [];
   const startTime = Date.now();
   
-  log.info(`Starting generation of ${count} pairing codes for ${phoneNumber}`);
+  log.req(`🚀 Starting generation of ${codeCount} pairing codes for ${cleanNumber}`);
 
-  for (let i = 0; i < count; i++) {
-    try {
+  try {
+    for (let i = 0; i < codeCount; i++) {
+      // Check connection before each request
       if (!sock || !isConnected) {
         throw new Error('Connection lost during code generation');
       }
 
-      const code = await sock.requestPairingCode(phoneNumber);
-      codes.push(code);
-      
-      log.code(`Code ${i + 1}/${count}: ${code} (${phoneNumber})`);
-      
-      // Add delay between requests (except for last one)
-      if (i < count - 1) {
-        await sleep(1000);
+      try {
+        const code = await sock.requestPairingCode(cleanNumber);
+        codes.push(code);
+        
+        log.code(`📱 [${i + 1}/${codeCount}] Generated: ${code} for ${cleanNumber}`);
+        
+        // Add required 1-second delay between requests (except for last one)
+        if (i < codeCount - 1) {
+          await sleep(1000);
+        }
+      } catch (codeError) {
+        log.err(`Failed to generate code ${i + 1}: ${codeError.message}`);
+        
+        // Handle rate limiting
+        if (codeError.message.includes('rate') || codeError.message.includes('limit')) {
+          log.reset('⏳ Rate limited - waiting 5 seconds...');
+          await sleep(5000);
+          i--; // Retry this iteration
+          continue;
+        }
+        
+        throw new Error(`Code generation failed at ${i + 1}/${codeCount}: ${codeError.message}`);
       }
-    } catch (error) {
-      log.error(`Failed to generate code ${i + 1}: ${error.message}`);
-      
-      // If it's a rate limit or connection issue, wait longer
-      if (error.message.includes('rate') || error.message.includes('limit')) {
-        log.warning('Rate limited - waiting 5 seconds...');
-        await sleep(5000);
-        i--; // Retry this iteration
-        continue;
-      }
-      
-      throw new Error(`Code generation failed at ${i + 1}/${count}: ${error.message}`);
     }
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    log.sock(`✅ Generated ${codes.length} codes in ${duration}s`);
+    
+    return codes;
+
+  } finally {
+    // CRITICAL: Always clear session after spam run (success OR error)
+    // This prevents the app from hanging and ensures fresh state
+    log.reset('🧹 Cleaning up after code generation...');
+    setTimeout(() => {
+      clearSessionAndRestart();
+    }, 1000);
   }
-
-  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-  log.success(`Generated ${codes.length} codes in ${duration}s`);
-
-  return codes;
 };
 
 // API Routes
 app.post('/api/generate', async (req, res) => {
   try {
     const { number, count } = req.body;
+    
+    log.req(`📥 API request: Generate ${count} codes for ${number}`);
     
     if (!number || !count) {
       return res.status(400).json({
@@ -213,21 +242,18 @@ app.post('/api/generate', async (req, res) => {
       });
     }
 
-    const phoneNumber = String(number).replace(/\D/g, '');
-    const codeCount = parseInt(count);
-
-    const codes = await generatePairingCodes(phoneNumber, codeCount);
+    const codes = await generatePairingCodes(number, count);
     
     res.json({
       success: true,
-      phone: phoneNumber,
+      phone: number.replace(/\D/g, ''),
       codes: codes,
       count: codes.length,
       timestamp: new Date().toISOString()
     });
 
   } catch (error) {
-    log.error(`API Generate error: ${error.message}`);
+    log.err(`API Generate error: ${error.message}`);
     res.status(500).json({
       success: false,
       error: error.message
@@ -236,19 +262,21 @@ app.post('/api/generate', async (req, res) => {
 });
 
 app.get('/api/status', (req, res) => {
+  log.req('📊 API status check');
+  
   res.json({
     ok: true,
     connected: isConnected,
     status: connectionStatus,
     user: userInfo,
-    reconnectAttempts: reconnectAttempts,
-    maxReconnects: MAX_RECONNECT_ATTEMPTS,
     timestamp: new Date().toISOString()
   });
 });
 
 // Web UI Routes
 app.get('/', (req, res) => {
+  log.req('🌐 Web UI accessed');
+  
   res.render('index', {
     connected: isConnected,
     status: connectionStatus,
@@ -260,16 +288,11 @@ app.get('/', (req, res) => {
 });
 
 app.post('/ui/generate', async (req, res) => {
-  let { number, count, combined } = req.body;
+  let { number, count } = req.body;
+  
+  log.req(`📥 UI request: Generate ${count} codes for ${number}`);
   
   try {
-    // Handle combined input (number|count)
-    if (combined && combined.includes('|')) {
-      const parts = combined.split('|');
-      number = parts[0]?.trim();
-      count = parts[1]?.trim();
-    }
-    
     if (!number || !count) {
       return res.render('index', {
         connected: isConnected,
@@ -281,22 +304,19 @@ app.post('/ui/generate', async (req, res) => {
       });
     }
 
-    const phoneNumber = String(number).replace(/\D/g, '');
-    const codeCount = parseInt(count);
-
-    const codes = await generatePairingCodes(phoneNumber, codeCount);
+    const codes = await generatePairingCodes(number, count);
     
     res.render('index', {
       connected: isConnected,
       status: connectionStatus,
       user: userInfo,
       error: null,
-      success: `Generated ${codes.length} pairing codes for ${phoneNumber}`,
+      success: `✅ Generated ${codes.length} pairing codes for ${number.replace(/\D/g, '')}`,
       codes: codes
     });
 
   } catch (error) {
-    log.error(`UI Generate error: ${error.message}`);
+    log.err(`UI Generate error: ${error.message}`);
     res.render('index', {
       connected: isConnected,
       status: connectionStatus,
@@ -321,9 +341,9 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Error handling
+// Error handling middleware
 app.use((err, req, res, next) => {
-  log.error(`Server error: ${err.message}`);
+  log.err(`Server error: ${err.message}`);
   res.status(500).json({ 
     success: false, 
     error: 'Internal server error' 
@@ -338,44 +358,49 @@ app.use((req, res) => {
   });
 });
 
-// Graceful shutdown
-const gracefulShutdown = () => {
-  log.warning('Shutting down gracefully...');
+// Graceful shutdown handling - REMOVED process.exit()!
+const gracefulShutdown = (signal) => {
+  log.reset(`🛑 Received ${signal} - shutting down gracefully...`);
   
   if (sock) {
     try {
       sock.end();
-      log.info('WhatsApp connection closed');
+      log.sock('WhatsApp connection closed');
     } catch (error) {
-      log.error(`Error closing WhatsApp connection: ${error.message}`);
+      log.err(`Error closing WhatsApp connection: ${error.message}`);
     }
   }
   
-  process.exit(0);
+  // CRITICAL FIX: Don't use process.exit() - let process manager handle it
+  log.boot('Shutdown complete - process manager will handle restart');
 };
 
-process.on('SIGINT', gracefulShutdown);
-process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-// Unhandled errors
+// Global error handlers - REMOVED process.exit()!
 process.on('uncaughtException', (error) => {
-  log.error(`Uncaught Exception: ${error.message}`);
-  log.error(error.stack);
+  log.err(`Uncaught Exception: ${error.message}`);
+  log.err(error.stack);
+  // CRITICAL FIX: DON'T exit - just log and continue
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  log.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+  log.err(`Unhandled Rejection at: ${promise}`);
+  log.err(`Reason: ${reason}`);
+  // CRITICAL FIX: DON'T exit - just log and continue
 });
 
-// Start server
+// Start the server
 app.listen(PORT, () => {
-  log.success(`🚀 WhatsApp Pairing Tool running on port ${PORT}`);
-  log.info(`📱 Web UI: http://localhost:${PORT}`);
-  log.info(`🔌 API: http://localhost:${PORT}/api`);
-  log.info('');
+  log.boot(`🚀 WhatsApp Pairing Tool running on port ${PORT}`);
+  log.boot(`📱 Web UI: http://localhost:${PORT}`);
+  log.boot(`🔌 API: http://localhost:${PORT}/api`);
+  log.boot('🎯 Designed for bug bounty pairing code testing');
+  log.boot('');
   
-  // Start WhatsApp connection
-  connectToWhatsApp();
+  // Initialize WhatsApp connection
+  startSock();
 });
 
 module.exports = app;
