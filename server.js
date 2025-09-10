@@ -1,166 +1,191 @@
-const express = require('express');
-const { makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
-const chalk = require('chalk');
-const fs = require('fs');
-const path = require('path');
-const rateLimit = require('express-rate-limit');
-const crypto = require('crypto');
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const chalk = require("chalk");
+const { Boom } = require("@hapi/boom");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+} = require("@whiskeysockets/baileys");
+const crypto = require("crypto");
 
+const app = express();
 const PORT = process.env.PORT || 3000;
-const ADMIN_KEY = process.env.ADMIN_KEY || 'default-admin-key-change-this';
-const MAX_COUNT = parseInt(process.env.MAX_COUNT) || 500;
-const PAIR_DELAY = parseInt(process.env.PAIR_DELAY) || 1000;
-const ALLOWED_PHONES = process.env.ALLOWED_PHONES ? process.env.ALLOWED_PHONES.split(',') : null;
+const SESSION_DIR = "./sessions";
+const MAX_COUNT = 500;
+const PAIR_DELAY = 1000; // 1s between codes
 
 let sock = null;
 let socketReady = false;
 let saveCreds = null;
-const phoneQueues = new Map();
 
-const app = express();
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
+app.set("view engine", "ejs");
+app.set("views", path.join(__dirname, "views"));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
-  message: { error: 'Too many requests, please try again later' }
-});
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// Helpers
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 const log = {
   boot: (msg) => console.log(chalk.blue(`[BOOT] ${msg}`)),
   sock: (msg) => console.log(chalk.green(`[SOCK] ${msg}`)),
-  req: (msg) => console.log(chalk.yellow(`[REQ] ${msg}`)),
   code: (msg) => console.log(chalk.magenta(`[CODE] ${msg}`)),
   reset: (msg) => console.log(chalk.red(`[RESET] ${msg}`)),
-  err: (msg) => console.log(chalk.red(`[ERR] ${msg}`))
+  err: (msg) => console.log(chalk.red(`[ERR] ${msg}`)),
 };
 
-const ensureDirectories = () => {
-  ['sessions', 'generated_codes', 'views'].forEach(dir => {
+// Ensure directories exist
+const ensureDirs = () => {
+  ["sessions", "generated_codes"].forEach((dir) => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   });
 };
 
-const clearSessionAndRestart = () => {
+// Clear session and restart
+function clearSessionAndRestart() {
   socketReady = false;
-  if (fs.existsSync('./sessions')) fs.rmSync('./sessions', { recursive: true, force: true });
-  log.reset('🗑️ Session cleared, restarting socket...');
-  setTimeout(startSock, 1200);
-};
+  if (fs.existsSync(SESSION_DIR)) {
+    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+    log.reset("🗑️ Session cleared.");
+  }
+  setTimeout(startSock, 1500);
+}
 
-const startSock = async () => {
+// Start Baileys socket
+async function startSock() {
   try {
-    ensureDirectories();
-    const { state, saveCreds: saveCredsFunc } = await useMultiFileAuthState('./sessions');
+    ensureDirs();
+    const { state, saveCreds: saveCredsFunc } = await useMultiFileAuthState(
+      SESSION_DIR
+    );
     saveCreds = saveCredsFunc;
 
     sock = makeWASocket({
       auth: state,
-      printQRInTerminal: false, // ⬅️ No auto QR spam
-      browser: ['CodeGen', 'Chrome', '1.0.0']
+      printQRInTerminal: false,
+      browser: ["PairBot", "Chrome", "1.0.0"],
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on("creds.update", saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on("connection.update", (update) => {
       const { connection, lastDisconnect } = update;
-      if (connection === 'open') {
+      if (connection === "open") {
         socketReady = true;
-        log.sock('✅ Socket connected (idle, waiting for number)');
-      }
-      if (connection === 'close') {
+        log.sock("✅ Connected (idle, waiting for number)");
+      } else if (connection === "close") {
         socketReady = false;
         const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
         log.err(`Socket closed. Reason: ${reason}`);
-        if ([DisconnectReason.connectionClosed, DisconnectReason.connectionLost].includes(reason)) {
-          setTimeout(startSock, 3000);
+        switch (reason) {
+          case DisconnectReason.badSession:
+          case DisconnectReason.loggedOut:
+            clearSessionAndRestart();
+            break;
+          case DisconnectReason.connectionClosed:
+          case DisconnectReason.connectionLost:
+          case DisconnectReason.timedOut:
+          case DisconnectReason.restartRequired:
+            setTimeout(startSock, 2000);
+            break;
+          default:
+            log.err("Unknown disconnect, restarting...");
+            setTimeout(startSock, 2000);
         }
       }
     });
-  } catch (e) {
-    log.err(`Failed to start socket: ${e.message}`);
-    setTimeout(startSock, 5000);
+  } catch (err) {
+    log.err(`Start sock failed: ${err.message}`);
+    setTimeout(startSock, 3000);
   }
-};
+}
 
-const saveCodesToDisk = async (phone, count, codes) => {
-  const runId = crypto.randomBytes(6).toString('hex');
-  const filename = `${phone}_${Date.now()}_${runId}.json`;
-  const filepath = path.join('./generated_codes', filename);
-  fs.writeFileSync(filepath, JSON.stringify({ phone, count, codes }, null, 2));
-  return filepath;
-};
+// Save codes to disk
+async function saveCodes(phone, count, codes) {
+  const runId = crypto.randomBytes(4).toString("hex");
+  const file = path.join(
+    "./generated_codes",
+    `${phone}_${Date.now()}_${runId}.json`
+  );
+  fs.writeFileSync(file, JSON.stringify({ phone, count, codes }, null, 2));
+  return file;
+}
 
-const generatePairingCodes = async (phone, count) => {
+// Generate pairing codes
+async function generateCodes(phone, count) {
   const codes = [];
   for (let i = 0; i < count; i++) {
     const raw = await sock.requestPairingCode(phone);
-    const formatted = raw.match(/.{1,4}/g)?.join('-') || raw;
+    const formatted = raw.match(/.{1,4}/g)?.join("-") || raw;
     codes.push(formatted);
     log.code(`(${i + 1}/${count}) ${formatted}`);
     if (i < count - 1) await sleep(PAIR_DELAY);
   }
   return codes;
-};
+}
 
-const queuePairingRequest = (phone, count) => new Promise((resolve, reject) => {
-  if (!phoneQueues.has(phone)) phoneQueues.set(phone, { requests: [], processing: false });
-  const queue = phoneQueues.get(phone);
-  queue.requests.push({ resolve, reject, count });
-  processPhoneQueue(phone);
-});
+// UI Routes
+app.get("/ui/generate", (req, res) =>
+  res.render("index", { connected: socketReady, error: null, codes: null, lastFile: null })
+);
 
-const processPhoneQueue = async (phone) => {
-  const queue = phoneQueues.get(phone);
-  if (queue.processing) return;
-  queue.processing = true;
-
-  while (queue.requests.length > 0) {
-    const { resolve, reject, count } = queue.requests.shift();
-    try {
-      if (!socketReady) throw new Error('Socket not ready, try again later');
-      const codes = await generatePairingCodes(phone, count);
-      const filepath = await saveCodesToDisk(phone, count, codes);
-      resolve({ codes, filepath });
-      clearSessionAndRestart();
-    } catch (err) {
-      log.err(`Code gen error: ${err.message}`);
-      reject(err);
-      clearSessionAndRestart();
-    }
-    await sleep(1500);
-  }
-  queue.processing = false;
-};
-
-const requireAdminKey = (req, res, next) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token || token !== ADMIN_KEY) return res.status(403).json({ error: 'Forbidden' });
-  next();
-};
-
-app.get('/api/status', (req, res) => res.json({ socketReady, user: sock?.user || null }));
-
-app.post('/api/generate', apiLimiter, requireAdminKey, async (req, res) => {
+app.post("/ui/generate", async (req, res) => {
   try {
-    const { number, count } = req.body;
-    if (!number || !count) return res.status(400).json({ error: 'Missing fields' });
-    const sanitizedCount = Math.min(MAX_COUNT, Math.max(1, parseInt(count)));
-    const { codes, filepath } = await queuePairingRequest(number, sanitizedCount);
-    res.json({ success: true, codes, file: filepath });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    if (!socketReady) {
+      return res.render("index", {
+        connected: false,
+        error: "Socket not ready. Try again later.",
+        codes: null,
+        lastFile: null,
+      });
+    }
+
+    let number, count;
+    if (req.body.combined) {
+      const [n, c] = req.body.combined.split("|");
+      number = n?.trim();
+      count = parseInt(c?.trim() || "1");
+    } else {
+      number = req.body.number?.trim();
+      count = parseInt(req.body.count || "1");
+    }
+
+    if (!number || !count) {
+      return res.render("index", {
+        connected: socketReady,
+        error: "Missing number or count",
+        codes: null,
+        lastFile: null,
+      });
+    }
+
+    const sanitizedCount = Math.min(MAX_COUNT, Math.max(1, count));
+    const codes = await generateCodes(number, sanitizedCount);
+    const filepath = await saveCodes(number, sanitizedCount, codes);
+
+    // Reset session after spam
+    clearSessionAndRestart();
+
+    res.render("index", {
+      connected: socketReady,
+      error: null,
+      codes,
+      lastFile: filepath,
+    });
+  } catch (err) {
+    log.err(`UI error: ${err.message}`);
+    clearSessionAndRestart();
+    res.render("index", {
+      connected: socketReady,
+      error: err.message,
+      codes: null,
+      lastFile: null,
+    });
   }
 });
-
-app.get('/ui/generate', (req, res) => res.render('index', { connected: socketReady }));
 
 app.listen(PORT, () => {
-  log.boot(`Server running on port ${PORT}`);
+  log.boot(`🌍 Server running on port ${PORT}`);
   startSock();
 });
